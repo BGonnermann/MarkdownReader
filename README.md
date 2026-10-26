@@ -12,9 +12,15 @@
   <a href="https://github.com/BGonnermann/MarkdownReader/actions/workflows/tests.yml"><img src="https://github.com/BGonnermann/MarkdownReader/actions/workflows/tests.yml/badge.svg" alt="Tests"></a>
   <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/License-MIT-8B5CF6" alt="MIT License">
+  <a href="https://github.com/BGonnermann/MarkdownReader/releases/latest"><img src="https://img.shields.io/github/v/release/BGonnermann/MarkdownReader?color=10B981&label=Latest" alt="Latest release"></a>
+  <a href="https://github.com/BGonnermann/MarkdownReader/releases"><img src="https://img.shields.io/github/downloads/BGonnermann/MarkdownReader/total?color=0969DA&label=Downloads" alt="Downloads"></a>
 </p>
 
 Markdown Reader gives you a live rendered preview beside the Markdown source, accepts files by drag-and-drop, and can export the finished document directly to PDF. It is built with Python and PySide6 and does not require a web browser or server.
+
+<p align="center">
+  <img src="docs/screenshot.png" width="920" alt="Markdown Reader showing a document in split view, with the Markdown source on the left and the rendered preview on the right">
+</p>
 
 ## Features
 
@@ -39,11 +45,35 @@ Markdown Reader gives you a live rendered preview beside the Markdown source, ac
 - Remembers your view mode, zoom level, and the split divider position
 - Familiar Windows keyboard shortcuts
 
+## Safe to open documents you did not write
+
+A Markdown reader opens files from other people, so a document should not be able
+to act on your machine just by being opened:
+
+- A link only opens on your confirmation when it points at a local file, a program,
+  or a non-web protocol. `[invoice](payload.exe)` cannot run on one click.
+- The preview never fetches anything from off this machine. An image pointing at a
+  network share or a remote URL is refused and counted in the status bar, so a
+  document cannot use a tracking pixel to leak your Windows credentials.
+- Saving writes a temporary file and swaps it in, so a save that fails partway
+  cannot leave the original truncated.
+
+Every release is built by GitHub Actions from a tagged commit and carries a signed
+attestation, so you can check a download came from this repository before running it:
+
+```bash
+gh attestation verify MarkdownReader-v0.1.4-windows-x64.zip --repo BGonnermann/MarkdownReader
+```
+
+Found a problem? Open an issue, or see [SECURITY.md](SECURITY.md) if it is sensitive.
+
 ## Download for Windows
 
 For the easiest setup, open the [latest GitHub Release](https://github.com/BGonnermann/MarkdownReader/releases/latest), download `MarkdownReader-v0.1.4-windows-x64.zip`, extract the entire folder, and run **`Markdown Reader.exe`**.
 
 The portable release does not require Python, `uv`, or an installer.
+
+Every version's changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## Requirements for running from source
 
