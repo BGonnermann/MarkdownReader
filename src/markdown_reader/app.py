@@ -1,10 +1,22 @@
 from __future__ import annotations
 
+import codecs
+import contextlib
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, QTimer, Qt, QUrl
-from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QDesktopServices, QFont, QIcon, QKeySequence, QTextDocument
+from PySide6.QtCore import QEvent, QFileSystemWatcher, QObject, QSettings, Qt, QTimer, QUrl
+from PySide6.QtGui import (
+    QAction,
+    QActionGroup,
+    QCloseEvent,
+    QDesktopServices,
+    QFont,
+    QIcon,
+    QKeySequence,
+    QShortcut,
+    QTextDocument,
+)
 from PySide6.QtPrintSupport import QPrinter
 from PySide6.QtWidgets import (
     QApplication,
@@ -18,16 +30,25 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSplitter,
+    QTextBrowser,
     QToolBar,
     QVBoxLayout,
     QWidget,
-    QTextBrowser,
 )
+
+from markdown_reader import __version__
 
 APP_NAME = "Markdown Reader"
 ICON_PATH = Path(__file__).resolve().parent / "assets" / "icon.png"
 MARKDOWN_FILTER = "Markdown files (*.md *.markdown *.mdown *.mkd);;All files (*.*)"
 MARKDOWN_EXTENSIONS = {".md", ".markdown", ".mdown", ".mkd"}
+# Links with these schemes open without a prompt. Anything else (local programs,
+# file:// targets, custom protocol handlers) asks first, because a Markdown file
+# from an untrusted source could otherwise launch an executable with one click.
+SAFE_LINK_SCHEMES = {"http", "https", "mailto"}
+VIEW_MODES = {"split", "preview", "editor"}
+MIN_ZOOM, MAX_ZOOM = -6, 20
+RENDER_DELAY_MS = 150
 WELCOME = """# Markdown Reader
 
 Drop a Markdown file anywhere in this window, or use **File → Open** (`Ctrl+O`).
@@ -49,17 +70,52 @@ a { color: #0969da; }
 """
 
 
+def read_markdown(path: Path) -> tuple[str, str, str]:
+    """Return the file's text plus the encoding and line ending to save it back with."""
+    raw = path.read_bytes()
+    encoding = "utf-8-sig" if raw.startswith(codecs.BOM_UTF8) else "utf-8"
+    try:
+        text = raw.decode(encoding)
+    except UnicodeDecodeError:
+        # Older Windows tools often save as Windows-1252; latin-1 accepts any byte.
+        encoding = "cp1252"
+        try:
+            text = raw.decode(encoding)
+        except UnicodeDecodeError:
+            encoding = "latin-1"
+            text = raw.decode(encoding)
+    newline = "\r\n" if "\r\n" in text else "\n"
+    return text.replace("\r\n", "\n").replace("\r", "\n"), encoding, newline
+
+
+def encoding_label(encoding: str) -> str:
+    return {"utf-8": "UTF-8", "utf-8-sig": "UTF-8 BOM", "cp1252": "Windows-1252", "latin-1": "Latin-1"}.get(
+        encoding, encoding
+    )
+
+
 class MarkdownWindow(QMainWindow):
     def __init__(self, initial_path: str | None = None) -> None:
         super().__init__()
         self.setWindowIcon(QIcon(str(ICON_PATH)))
         self.settings = QSettings("HermesTools", APP_NAME)
         self.current_path: Path | None = None
+        self.encoding = "utf-8"
+        self.newline = "\n"
         self.dirty = False
         self.last_find = ""
-        self._preview_zoom = 0
-        self._editor_zoom = 0
+        self.view_mode = "split"
+        self._zoom = 0
         self._updating_editor = False
+        self._reload_prompt_open = False
+
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.setInterval(RENDER_DELAY_MS)
+        self._render_timer.timeout.connect(self._render_editor)
+
+        self.watcher = QFileSystemWatcher(self)
+        self.watcher.fileChanged.connect(self._on_file_changed)
 
         self.setAcceptDrops(True)
         self.resize(1100, 760)
@@ -89,6 +145,7 @@ class MarkdownWindow(QMainWindow):
         self.editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         self.editor.setFont(QFont("Consolas", 11))
         self.editor.textChanged.connect(self._on_text_changed)
+        self.editor.cursorPositionChanged.connect(self._update_position)
 
         self.preview = QTextBrowser()
         # QTextBrowser also accepts drops by default; let the main window handle
@@ -97,6 +154,10 @@ class MarkdownWindow(QMainWindow):
         self.preview.setOpenLinks(False)
         self.preview.anchorClicked.connect(self._open_link)
         self.preview.document().setDefaultStyleSheet(PREVIEW_CSS)
+
+        # Ctrl+wheel would otherwise zoom one pane on its own and bypass the zoom level.
+        self.editor.viewport().installEventFilter(self)
+        self.preview.viewport().installEventFilter(self)
 
         self.splitter.addWidget(self.editor)
         self.splitter.addWidget(self.preview)
@@ -109,6 +170,7 @@ class MarkdownWindow(QMainWindow):
         find_layout.addWidget(QLabel("Find:"))
         self.find_input = QLineEdit()
         self.find_input.setClearButtonEnabled(True)
+        self.find_input.setPlaceholderText("Enter: next  ·  Shift+Enter: previous  ·  Esc: close")
         self.find_input.returnPressed.connect(self.find_next)
         find_layout.addWidget(self.find_input, 1)
         previous = QPushButton("Previous")
@@ -120,10 +182,15 @@ class MarkdownWindow(QMainWindow):
         close_button = QPushButton("Close")
         close_button.clicked.connect(self.hide_find)
         find_layout.addWidget(close_button)
+        QShortcut(QKeySequence("Shift+Return"), self.find_input, self.find_previous)
+        escape = QShortcut(QKeySequence.StandardKey.Cancel, self.find_bar, self.hide_find)
+        escape.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self.find_bar.hide()
         layout.addWidget(self.find_bar)
 
         self.setCentralWidget(root)
+        self.position_label = QLabel()
+        self.statusBar().addPermanentWidget(self.position_label)
         self.statusBar().showMessage("Drop a Markdown file here to open it")
 
     def _action(self, text: str, slot, shortcut: str | QKeySequence | None = None) -> QAction:
@@ -131,6 +198,8 @@ class MarkdownWindow(QMainWindow):
         action.triggered.connect(slot)
         if shortcut:
             action.setShortcut(shortcut)
+            native = action.shortcut().toString(QKeySequence.SequenceFormat.NativeText)
+            action.setToolTip(f"{text.replace('&', '').rstrip('…')} ({native})")
         return action
 
     def _build_actions(self) -> None:
@@ -150,6 +219,9 @@ class MarkdownWindow(QMainWindow):
         self.select_all_action = self._action("Select &All", self.select_all, QKeySequence.StandardKey.SelectAll)
         self.find_action = self._action("&Find…", self.show_find, QKeySequence.StandardKey.Find)
         self.find_next_action = self._action("Find &Next", self.find_next, QKeySequence.StandardKey.FindNext)
+        self.find_previous_action = self._action(
+            "Find Pre&vious", self.find_previous, QKeySequence.StandardKey.FindPrevious
+        )
 
         self.zoom_in_action = self._action("Zoom &In", self.zoom_in, QKeySequence.StandardKey.ZoomIn)
         self.zoom_out_action = self._action("Zoom &Out", self.zoom_out, QKeySequence.StandardKey.ZoomOut)
@@ -168,6 +240,7 @@ class MarkdownWindow(QMainWindow):
         action.setCheckable(True)
         action.setChecked(checked)
         action.setShortcut(shortcut)
+        action.setToolTip(f"{text.replace('&', '')} ({shortcut})")
         action.triggered.connect(lambda _checked=False, value=mode: self.set_view(value))
         self.view_group.addAction(action)
         return action
@@ -176,6 +249,7 @@ class MarkdownWindow(QMainWindow):
         file_menu = self.menuBar().addMenu("&File")
         file_menu.addActions([self.new_action, self.open_action])
         self.recent_menu = QMenu("Open &Recent", self)
+        self.recent_menu.setToolTipsVisible(True)
         file_menu.addMenu(self.recent_menu)
         file_menu.addSeparator()
         file_menu.addActions([self.close_action, self.save_action, self.save_as_action])
@@ -189,7 +263,7 @@ class MarkdownWindow(QMainWindow):
         edit_menu.addSeparator()
         edit_menu.addActions([self.cut_action, self.copy_action, self.paste_action, self.select_all_action])
         edit_menu.addSeparator()
-        edit_menu.addActions([self.find_action, self.find_next_action])
+        edit_menu.addActions([self.find_action, self.find_next_action, self.find_previous_action])
 
         view_menu = self.menuBar().addMenu("&View")
         view_menu.addActions([self.split_action, self.preview_action, self.edit_action])
@@ -202,6 +276,7 @@ class MarkdownWindow(QMainWindow):
 
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("Main toolbar", self)
+        toolbar.setObjectName("mainToolbar")
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
         toolbar.addActions([self.open_action, self.save_action, self.pdf_action])
@@ -217,53 +292,80 @@ class MarkdownWindow(QMainWindow):
         state = self.settings.value("windowState")
         if state:
             self.restoreState(state)
+        self.set_view(str(self.settings.value("viewMode", "split")))
+        with contextlib.suppress(TypeError, ValueError):
+            self._set_zoom(int(self.settings.value("zoom", 0)))
+        self.statusBar().clearMessage()
 
     def _show_welcome(self) -> None:
+        self._render_timer.stop()
+        self._watch(None)
+        self.current_path = None
+        self.encoding, self.newline = "utf-8", "\n"
         self._updating_editor = True
         self.editor.clear()
         self._updating_editor = False
-        self.preview.document().setMarkdown(WELCOME, QTextDocument.MarkdownDialectGitHub)
-        self.preview.document().setDefaultStyleSheet(PREVIEW_CSS)
-        self.current_path = None
+        self._render(WELCOME)
         self.dirty = False
         self._update_title()
+        self._update_position()
 
-    def _render(self, text: str) -> None:
+    def _render(self, text: str, keep_scroll: bool = False) -> None:
+        bar = self.preview.verticalScrollBar()
+        scroll = bar.value()
         document = self.preview.document()
         if self.current_path:
             document.setBaseUrl(QUrl.fromLocalFile(str(self.current_path.parent) + "/"))
         else:
             document.setBaseUrl(QUrl())
         document.setMarkdown(text, QTextDocument.MarkdownDialectGitHub)
-        document.setDefaultStyleSheet(PREVIEW_CSS)
+        # Re-rendering resets the preview to the top; keep the reader's place while typing.
+        bar.setValue(scroll if keep_scroll else 0)
+
+    def _render_editor(self) -> None:
+        self._render_timer.stop()
+        self._render(self.editor.toPlainText(), keep_scroll=True)
+        self._update_position()
 
     def _on_text_changed(self) -> None:
         if self._updating_editor:
             return
-        self.dirty = True
-        self._render(self.editor.toPlainText())
-        self._update_title()
+        if not self.dirty:
+            self.dirty = True
+            self._update_title()
+        self._render_timer.start()
 
     def _update_title(self) -> None:
         name = self.current_path.name if self.current_path else "Untitled"
         marker = " *" if self.dirty else ""
         self.setWindowTitle(f"{name}{marker} — {APP_NAME}")
 
+    def _update_position(self) -> None:
+        cursor = self.editor.textCursor()
+        words = len(self.editor.toPlainText().split())
+        line_ending = "CRLF" if self.newline == "\r\n" else "LF"
+        self.position_label.setText(
+            f"Ln {cursor.blockNumber() + 1}, Col {cursor.positionInBlock() + 1}   ·   "
+            f"{words:,} words   ·   {encoding_label(self.encoding)}   ·   {line_ending}  "
+        )
+
+    def _dialog_directory(self) -> Path:
+        if self.current_path:
+            return self.current_path.parent
+        return Path(str(self.settings.value("lastDirectory", str(Path.home()))))
+
     def new_document(self) -> None:
         if not self._confirm_discard():
             return
-        self.current_path = None
-        self._updating_editor = True
-        self.editor.clear()
-        self._updating_editor = False
-        self.dirty = False
+        self._show_welcome()
         self._render("")
-        self._update_title()
+        if self.view_mode == "preview":
+            self.set_view("split")
         self.editor.setFocus()
         self.statusBar().showMessage("New document", 3000)
 
     def open_dialog(self) -> None:
-        start = self.settings.value("lastDirectory", str(Path.home()))
+        start = str(self._dialog_directory())
         filename, _ = QFileDialog.getOpenFileName(self, "Open Markdown", start, MARKDOWN_FILTER)
         if filename:
             self.open_path(Path(filename))
@@ -276,25 +378,30 @@ class MarkdownWindow(QMainWindow):
         if not self._confirm_discard():
             return False
         try:
-            text = path.read_text(encoding="utf-8-sig")
-        except UnicodeDecodeError:
-            text = path.read_text(encoding="utf-8", errors="replace")
+            text, encoding, newline = read_markdown(path)
         except OSError as exc:
             QMessageBox.critical(self, APP_NAME, f"Could not open the file:\n{exc}")
             return False
 
         self.current_path = path
+        self._load(text, encoding, newline)
+        self.settings.setValue("lastDirectory", str(path.parent))
+        self._add_recent(path)
+        self._watch(path)
+        self.statusBar().showMessage(f"Opened {path}", 5000)
+        return True
+
+    def _load(self, text: str, encoding: str, newline: str, keep_scroll: bool = False) -> None:
+        self._render_timer.stop()
+        self.encoding, self.newline = encoding, newline
         self._updating_editor = True
         self.editor.setPlainText(text)
         self._updating_editor = False
         self.dirty = False
-        self._render(text)
+        self._render(text, keep_scroll)
         self.editor.document().setModified(False)
-        self.settings.setValue("lastDirectory", str(path.parent))
-        self._add_recent(path)
         self._update_title()
-        self.statusBar().showMessage(f"Opened {path}", 5000)
-        return True
+        self._update_position()
 
     def close_document(self) -> None:
         if self._confirm_discard():
@@ -307,7 +414,7 @@ class MarkdownWindow(QMainWindow):
         return self._write_to(self.current_path)
 
     def save_as(self) -> bool:
-        suggested = str(self.current_path or (Path.home() / "document.md"))
+        suggested = str(self.current_path or (self._dialog_directory() / "document.md"))
         filename, _ = QFileDialog.getSaveFileName(self, "Save Markdown As", suggested, MARKDOWN_FILTER)
         if not filename:
             return False
@@ -317,23 +424,82 @@ class MarkdownWindow(QMainWindow):
         return self._write_to(path)
 
     def _write_to(self, path: Path) -> bool:
+        text = self.editor.toPlainText()
+        note = ""
         try:
-            path.write_text(self.editor.toPlainText(), encoding="utf-8")
+            try:
+                path.write_text(text, encoding=self.encoding, newline=self.newline)
+            except UnicodeEncodeError:
+                # The user typed characters the original legacy encoding cannot hold.
+                note = f" (converted from {encoding_label(self.encoding)} to UTF-8)"
+                self.encoding = "utf-8"
+                path.write_text(text, encoding=self.encoding, newline=self.newline)
         except OSError as exc:
             QMessageBox.critical(self, APP_NAME, f"Could not save the file:\n{exc}")
             return False
         self.current_path = path.resolve()
         self.dirty = False
         self.editor.document().setModified(False)
-        self._render(self.editor.toPlainText())
+        self._render(text, keep_scroll=True)
         self.settings.setValue("lastDirectory", str(self.current_path.parent))
         self._add_recent(self.current_path)
+        self._watch(self.current_path)
         self._update_title()
-        self.statusBar().showMessage(f"Saved {self.current_path}", 5000)
+        self._update_position()
+        self.statusBar().showMessage(f"Saved {self.current_path}{note}", 5000)
         return True
 
+    def _watch(self, path: Path | None) -> None:
+        if self.watcher.files():
+            self.watcher.removePaths(self.watcher.files())
+        if path is not None:
+            self.watcher.addPath(str(path))
+
+    def _on_file_changed(self, name: str) -> None:
+        path = self.current_path
+        if path is None or Path(name) != path or self._reload_prompt_open:
+            return
+        if not path.exists():
+            # Many editors save by replacing the file, which drops the watch; check again shortly.
+            QTimer.singleShot(300, lambda: path.exists() and self._rewatch_and_reload(path))
+            return
+        self._rewatch_and_reload(path)
+
+    def _rewatch_and_reload(self, path: Path) -> None:
+        if path != self.current_path:
+            return
+        if str(path) not in self.watcher.files():
+            self.watcher.addPath(str(path))
+        try:
+            text, encoding, newline = read_markdown(path)
+        except OSError:
+            return
+        if text == self.editor.toPlainText():
+            return  # Our own save, or a change that did not touch the content.
+        if self.dirty:
+            self._reload_prompt_open = True
+            try:
+                answer = QMessageBox.question(
+                    self,
+                    "File changed on disk",
+                    f'"{path.name}" was changed by another program.\n\nReload it and discard your unsaved changes?',
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+            finally:
+                self._reload_prompt_open = False
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self._load(text, encoding, newline, keep_scroll=True)
+        self.statusBar().showMessage(f"Reloaded {path.name} after it changed on disk", 5000)
+
     def export_pdf(self) -> None:
-        suggested = (self.current_path.with_suffix(".pdf") if self.current_path else Path.home() / "document.pdf")
+        if self._render_timer.isActive():
+            self._render_editor()
+        if self.current_path:
+            suggested = self.current_path.with_suffix(".pdf")
+        else:
+            suggested = self._dialog_directory() / "document.pdf"
         filename, _ = QFileDialog.getSaveFileName(self, "Export PDF", str(suggested), "PDF files (*.pdf)")
         if not filename:
             return
@@ -354,13 +520,12 @@ class MarkdownWindow(QMainWindow):
     def _confirm_discard(self) -> bool:
         if not self.dirty:
             return True
+        name = self.current_path.name if self.current_path else "Untitled"
         result = QMessageBox.question(
             self,
             "Unsaved changes",
-            "Save changes before continuing?",
-            QMessageBox.StandardButton.Save
-            | QMessageBox.StandardButton.Discard
-            | QMessageBox.StandardButton.Cancel,
+            f'Save changes to "{name}" before continuing?',
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Save,
         )
         if result == QMessageBox.StandardButton.Cancel:
@@ -370,8 +535,9 @@ class MarkdownWindow(QMainWindow):
         return True
 
     def set_view(self, mode: str) -> None:
-        if mode not in {"split", "preview", "editor"}:
+        if mode not in VIEW_MODES:
             return
+        self.view_mode = mode
         self.editor.setVisible(mode in {"split", "editor"})
         self.preview.setVisible(mode in {"split", "preview"})
         self.split_action.setChecked(mode == "split")
@@ -382,36 +548,40 @@ class MarkdownWindow(QMainWindow):
         self.statusBar().showMessage(f"{mode.title()} view", 2000)
 
     def zoom_in(self) -> None:
-        self.preview.zoomIn(1)
-        self.editor.zoomIn(1)
-        self._preview_zoom += 1
-        self._editor_zoom += 1
-        self._show_zoom()
+        self._set_zoom(self._zoom + 1)
 
     def zoom_out(self) -> None:
-        self.preview.zoomOut(1)
-        self.editor.zoomOut(1)
-        self._preview_zoom -= 1
-        self._editor_zoom -= 1
-        self._show_zoom()
+        self._set_zoom(self._zoom - 1)
 
     def zoom_reset(self) -> None:
-        if self._preview_zoom > 0:
-            self.preview.zoomOut(self._preview_zoom)
-        elif self._preview_zoom < 0:
-            self.preview.zoomIn(-self._preview_zoom)
-        if self._editor_zoom > 0:
-            self.editor.zoomOut(self._editor_zoom)
-        elif self._editor_zoom < 0:
-            self.editor.zoomIn(-self._editor_zoom)
-        self._preview_zoom = self._editor_zoom = 0
-        self._show_zoom()
+        self._set_zoom(0)
 
-    def _show_zoom(self) -> None:
-        self.statusBar().showMessage(f"Zoom: {100 + self._preview_zoom * 10}%", 2000)
+    def _set_zoom(self, level: int) -> None:
+        level = max(MIN_ZOOM, min(MAX_ZOOM, level))
+        delta = level - self._zoom
+        if delta > 0:
+            self.preview.zoomIn(delta)
+            self.editor.zoomIn(delta)
+        elif delta < 0:
+            self.preview.zoomOut(-delta)
+            self.editor.zoomOut(-delta)
+        self._zoom = level
+        self.statusBar().showMessage(f"Zoom: {100 + self._zoom * 10}%", 2000)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if event.type() == QEvent.Type.Wheel and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            step = event.angleDelta().y()
+            if step:
+                self._set_zoom(self._zoom + (1 if step > 0 else -1))
+            return True
+        return super().eventFilter(watched, event)
+
+    def _find_target(self) -> QPlainTextEdit | QTextBrowser:
+        # In preview-only view the editor is hidden, so search what the reader can see.
+        return self.preview if self.editor.isHidden() else self.editor
 
     def show_find(self) -> None:
-        selected = self.editor.textCursor().selectedText()
+        selected = self._find_target().textCursor().selectedText()
         if selected:
             self.find_input.setText(selected)
         elif self.last_find:
@@ -422,7 +592,7 @@ class MarkdownWindow(QMainWindow):
 
     def hide_find(self) -> None:
         self.find_bar.hide()
-        self.editor.setFocus()
+        self._find_target().setFocus()
 
     def find_next(self) -> None:
         self._find(backward=False)
@@ -436,12 +606,13 @@ class MarkdownWindow(QMainWindow):
             self.show_find()
             return
         self.last_find = term
+        target = self._find_target()
         flags = QTextDocument.FindFlag.FindBackward if backward else QTextDocument.FindFlag(0)
-        if not self.editor.find(term, flags):
-            cursor = self.editor.textCursor()
+        if not target.find(term, flags):
+            cursor = target.textCursor()
             cursor.movePosition(cursor.MoveOperation.End if backward else cursor.MoveOperation.Start)
-            self.editor.setTextCursor(cursor)
-            if not self.editor.find(term, flags):
+            target.setTextCursor(cursor)
+            if not target.find(term, flags):
                 self.statusBar().showMessage(f'No matches for "{term}"', 3000)
 
     def copy(self) -> None:
@@ -459,15 +630,45 @@ class MarkdownWindow(QMainWindow):
             self.editor.selectAll()
 
     def _open_link(self, url: QUrl) -> None:
-        if url.isRelative() and self.current_path:
-            if not url.path() and url.hasFragment():
-                self.preview.scrollToAnchor(url.fragment())
+        if not url.scheme() and not url.path() and url.hasFragment():
+            self.preview.scrollToAnchor(url.fragment())
+            return
+        if url.isRelative():
+            if not self.current_path:
+                self.statusBar().showMessage("Save the document first to follow relative links", 4000)
                 return
             target = QUrl.fromLocalFile(str((self.current_path.parent / url.path()).resolve()))
-            target.setQuery(url.query())
-            target.setFragment(url.fragment())
+            if url.hasQuery():
+                target.setQuery(url.query())
+            if url.hasFragment():
+                target.setFragment(url.fragment())
             url = target
+
+        if url.isLocalFile():
+            path = Path(url.toLocalFile())
+            if path.suffix.lower() in MARKDOWN_EXTENSIONS and path.is_file():
+                if self.open_path(path) and url.hasFragment():
+                    self.preview.scrollToAnchor(url.fragment())
+                return
+            if not path.exists():
+                QMessageBox.warning(self, APP_NAME, f"The linked file does not exist:\n{path}")
+                return
+            if not self._confirm_external(f"This link opens a file outside {APP_NAME}:\n\n{path}"):
+                return
+        elif url.scheme().lower() not in SAFE_LINK_SCHEMES:
+            if not self._confirm_external(f'This link uses the "{url.scheme()}:" protocol:\n\n{url.toString()}'):
+                return
         QDesktopServices.openUrl(url)
+
+    def _confirm_external(self, message: str) -> bool:
+        answer = QMessageBox.warning(
+            self,
+            "Open link?",
+            f"{message}\n\nOnly continue if you trust this document. Open it with its default program?",
+            QMessageBox.StandardButton.Open | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        return answer == QMessageBox.StandardButton.Open
 
     def _recent_paths(self) -> list[str]:
         value = self.settings.value("recentFiles", [])
@@ -489,8 +690,10 @@ class MarkdownWindow(QMainWindow):
             empty = self.recent_menu.addAction("No recent files")
             empty.setEnabled(False)
             return
-        for item in paths:
-            action = self.recent_menu.addAction(Path(item).name)
+        for number, item in enumerate(paths, start=1):
+            path = Path(item)
+            mnemonic = f"&{number}" if number < 10 else "1&0"
+            action = self.recent_menu.addAction(f"{mnemonic}  {path.name}    ({path.parent.name or path.parent})")
             action.setToolTip(item)
             action.triggered.connect(lambda _checked=False, p=item: self.open_path(Path(p)))
         self.recent_menu.addSeparator()
@@ -517,7 +720,7 @@ class MarkdownWindow(QMainWindow):
         QMessageBox.about(
             self,
             f"About {APP_NAME}",
-            "<b>Markdown Reader 0.1.3</b><br><br>"
+            f"<b>{APP_NAME} {__version__}</b><br><br>"
             "A small native Markdown reader and editor with live preview, "
             "drag-and-drop, PDF export, search, and zoom.",
         )
@@ -528,6 +731,8 @@ class MarkdownWindow(QMainWindow):
             return
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("windowState", self.saveState())
+        self.settings.setValue("viewMode", self.view_mode)
+        self.settings.setValue("zoom", self._zoom)
         event.accept()
 
 

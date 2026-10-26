@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/VesperEngineering/MarkdownReader/actions/workflows/tests.yml"><img src="https://github.com/VesperEngineering/MarkdownReader/actions/workflows/tests.yml/badge.svg" alt="Tests"></a>
+  <a href="https://github.com/BGonnermann/MarkdownReader/actions/workflows/tests.yml"><img src="https://github.com/BGonnermann/MarkdownReader/actions/workflows/tests.yml/badge.svg" alt="Tests"></a>
   <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/License-MIT-8B5CF6" alt="MIT License">
 </p>
@@ -24,16 +24,21 @@ Markdown Reader gives you a live rendered preview beside the Markdown source, ac
 - New, Open, Close, Save, and Save As commands
 - Export the rendered document as a PDF
 - Zoom in, zoom out, and reset zoom
-- Find text and move between matches
+- Find text and move between matches (works in preview-only view too)
 - Undo, redo, cut, copy, paste, and select all
 - Recent-files menu
 - Unsaved-change protection
-- Local images and links resolved relative to the Markdown file
+- Local images and links resolved relative to the Markdown file; links to other Markdown files open in the app
+- Asks before a link launches a local program or a non-web protocol, so an untrusted document can't run an `.exe` with one click
+- Automatically reloads a file when another program changes it (asks first if you have unsaved edits)
+- Keeps each file's original encoding (UTF-8, UTF-8 with BOM, Windows-1252) and line endings (LF/CRLF) when saving
+- Status bar with line, column, word count, encoding, and line endings
+- Remembers your view mode and zoom level
 - Familiar Windows keyboard shortcuts
 
 ## Download for Windows
 
-For the easiest setup, open the [latest GitHub Release](https://github.com/VesperEngineering/MarkdownReader/releases/latest), download `MarkdownReader-v0.1.3-windows-x64.zip`, extract the entire folder, and run **`Markdown Reader.exe`**.
+For the easiest setup, open the [latest GitHub Release](https://github.com/BGonnermann/MarkdownReader/releases/latest), download `MarkdownReader-v0.1.3-windows-x64.zip`, extract the entire folder, and run **`Markdown Reader.exe`**.
 
 The portable release does not require Python, `uv`, or an installer.
 
@@ -48,7 +53,7 @@ The portable release does not require Python, `uv`, or an installer.
 1. Download or clone this repository:
 
    ```bash
-   git clone https://github.com/VesperEngineering/MarkdownReader.git
+   git clone https://github.com/BGonnermann/MarkdownReader.git
    cd MarkdownReader
    ```
 
@@ -82,7 +87,9 @@ A sample document is included as `sample.md`.
 | `Ctrl+W` | Close file |
 | `Ctrl+P` | Export as PDF |
 | `Ctrl+F` | Find |
-| `Ctrl++` / `Ctrl+-` | Zoom in/out |
+| `F3` / `Shift+F3` | Find next/previous |
+| `Esc` | Close the find bar |
+| `Ctrl++` / `Ctrl+-` / `Ctrl+Wheel` | Zoom in/out |
 | `Ctrl+0` | Reset zoom |
 | `Ctrl+1` | Split view |
 | `Ctrl+2` | Preview only |
@@ -111,10 +118,11 @@ Install the development dependencies and run the test suite:
 
 ```bash
 uv sync --extra dev
+uv run ruff check .
 uv run pytest
 ```
 
-The tests cover drag-and-drop routing, Markdown loading and rendering, UTF-8 editing and saving, Save As, view and zoom controls, and real PDF generation.
+The tests cover drag-and-drop routing, Markdown loading and rendering, encoding and line-ending preservation, Save As, link safety, reloading on external changes, find, view and zoom controls, and real PDF generation.
 
 ## Technology
 

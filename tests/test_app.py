@@ -1,19 +1,50 @@
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import QSettings, QUrl
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import QFileDialog
+from PySide6.QtWidgets import QFileDialog, QMessageBox
 
-from markdown_reader.app import MarkdownWindow
+from markdown_reader import app
+from markdown_reader.app import MarkdownWindow, read_markdown
 
 
 @pytest.fixture
-def window(qtbot, monkeypatch):
-    monkeypatch.setattr(MarkdownWindow, "_restore_settings", lambda self: None)
+def settings_file(tmp_path):
+    return tmp_path / "settings.ini"
+
+
+@pytest.fixture
+def window(qtbot, monkeypatch, settings_file):
+    # Keep tests out of the real user settings (the Windows registry).
+    monkeypatch.setattr(app, "QSettings", lambda *args: QSettings(str(settings_file), QSettings.Format.IniFormat))
+    # A real modal dialog would hang the run, e.g. "Unsaved changes" when pytest-qt
+    # closes a window that a test left dirty. Tests that care use answer_dialogs().
+    monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: QMessageBox.StandardButton.Discard)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args, **kwargs: QMessageBox.StandardButton.Cancel)
+    monkeypatch.setattr(QMessageBox, "critical", lambda *args, **kwargs: QMessageBox.StandardButton.Ok)
     widget = MarkdownWindow()
     qtbot.addWidget(widget)
     return widget
+
+
+@pytest.fixture
+def opened(monkeypatch):
+    urls: list[QUrl] = []
+    monkeypatch.setattr(QDesktopServices, "openUrl", lambda url: urls.append(url) or True)
+    return urls
+
+
+def answer_dialogs(monkeypatch, button):
+    asked: list[str] = []
+
+    def reply(*args, **kwargs):
+        asked.append(args[2])
+        return button
+
+    monkeypatch.setattr(QMessageBox, "question", reply)
+    monkeypatch.setattr(QMessageBox, "warning", reply)
+    return asked
 
 
 def test_open_renders_markdown(window, tmp_path):
@@ -83,9 +114,12 @@ def test_view_modes_and_zoom(window):
     assert window.split_action.isChecked()
 
     window.zoom_in()
-    assert window._preview_zoom == 1
+    assert window._zoom == 1
     window.zoom_reset()
-    assert window._preview_zoom == 0
+    assert window._zoom == 0
+    for _ in range(100):
+        window.zoom_out()
+    assert window._zoom == app.MIN_ZOOM
 
 
 def test_pdf_export_creates_nonempty_file(window, tmp_path, monkeypatch):
@@ -106,29 +140,206 @@ def test_pdf_export_creates_nonempty_file(window, tmp_path, monkeypatch):
     assert output.read_bytes().startswith(b"%PDF")
 
 
-def test_open_link_preserves_fragment_for_relative_file(window, tmp_path, monkeypatch):
+def test_markdown_link_opens_in_the_app(window, tmp_path, opened):
     source = tmp_path / "index.md"
     source.write_text("[Details](chapter.md#details)", encoding="utf-8")
     target = tmp_path / "chapter.md"
     target.write_text("# Details", encoding="utf-8")
-    opened: list[QUrl] = []
-    monkeypatch.setattr(QDesktopServices, "openUrl", lambda url: opened.append(url) or True)
     window.open_path(source)
 
     window._open_link(QUrl("chapter.md#details"))
 
-    assert len(opened) == 1
-    assert Path(opened[0].toLocalFile()) == target.resolve()
-    assert opened[0].fragment() == "details"
+    assert opened == []
+    assert window.current_path == target.resolve()
 
 
-def test_open_link_keeps_document_anchor_in_preview(window, tmp_path, monkeypatch):
+def test_open_link_keeps_document_anchor_in_preview(window, tmp_path, opened):
     source = tmp_path / "index.md"
     source.write_text("# Details\n\n[Jump to details](#details)", encoding="utf-8")
-    opened: list[QUrl] = []
-    monkeypatch.setattr(QDesktopServices, "openUrl", lambda url: opened.append(url) or True)
     window.open_path(source)
 
     window._open_link(QUrl("#details"))
 
     assert opened == []
+
+
+def test_anchor_link_works_in_unsaved_document(window, opened):
+    window.new_document()
+    window.editor.setPlainText("# Top\n\n[Back to top](#top)")
+
+    window._open_link(QUrl("#top"))
+
+    assert opened == []
+
+
+def test_link_to_local_program_asks_before_running(window, tmp_path, opened, monkeypatch):
+    source = tmp_path / "index.md"
+    source.write_text("[Click me](payload.exe)", encoding="utf-8")
+    (tmp_path / "payload.exe").write_bytes(b"MZ")
+    window.open_path(source)
+    asked = answer_dialogs(monkeypatch, QMessageBox.StandardButton.Cancel)
+
+    window._open_link(QUrl("payload.exe"))
+    window._open_link(QUrl("ms-settings:privacy"))
+
+    assert opened == []
+    assert len(asked) == 2
+
+    answer_dialogs(monkeypatch, QMessageBox.StandardButton.Open)
+    window._open_link(QUrl("payload.exe"))
+    assert Path(opened[0].toLocalFile()) == (tmp_path / "payload.exe").resolve()
+    assert "?" not in opened[0].toString()
+
+
+def test_web_links_open_without_prompt(window, opened, monkeypatch):
+    asked = answer_dialogs(monkeypatch, QMessageBox.StandardButton.Cancel)
+
+    window._open_link(QUrl("https://example.com/page"))
+
+    assert [url.toString() for url in opened] == ["https://example.com/page"]
+    assert asked == []
+
+
+def test_save_keeps_original_line_endings(window, tmp_path):
+    unix = tmp_path / "unix.md"
+    unix.write_bytes(b"one\ntwo\n")
+    windows = tmp_path / "windows.md"
+    windows.write_bytes(b"one\r\ntwo\r\n")
+
+    for path in (unix, windows):
+        window.open_path(path)
+        window.editor.setPlainText(window.editor.toPlainText() + "three\n")
+        assert window.save()
+
+    assert unix.read_bytes() == b"one\ntwo\nthree\n"
+    assert windows.read_bytes() == b"one\r\ntwo\r\nthree\r\n"
+
+
+def test_legacy_encoding_survives_a_save(window, tmp_path):
+    source = tmp_path / "legacy.md"
+    source.write_bytes("Café naïve".encode("cp1252"))
+
+    window.open_path(source)
+    assert window.editor.toPlainText() == "Café naïve"
+    window.editor.setPlainText("Café naïve!")
+    assert window.save()
+
+    assert source.read_bytes() == "Café naïve!".encode("cp1252")
+
+
+def test_legacy_file_switches_to_utf8_when_needed(window, tmp_path):
+    source = tmp_path / "legacy.md"
+    source.write_bytes("Café".encode("cp1252"))
+    window.open_path(source)
+
+    window.editor.setPlainText("Café → 日本")
+    assert window.save()
+
+    assert source.read_text(encoding="utf-8") == "Café → 日本"
+    assert window.encoding == "utf-8"
+
+
+def test_utf8_bom_is_preserved(window, tmp_path):
+    source = tmp_path / "bom.md"
+    source.write_bytes(b"\xef\xbb\xbf# Title\n")
+
+    assert read_markdown(source) == ("# Title\n", "utf-8-sig", "\n")
+    window.open_path(source)
+    window.editor.setPlainText("# New title\n")
+    window.save()
+
+    assert source.read_bytes() == b"\xef\xbb\xbf# New title\n"
+
+
+def test_preview_keeps_scroll_position_while_typing(window, qtbot, tmp_path):
+    source = tmp_path / "long.md"
+    source.write_text("\n\n".join(f"Paragraph {i}" for i in range(400)), encoding="utf-8")
+    window.show()
+    window.open_path(source)
+    bar = window.preview.verticalScrollBar()
+    bar.setValue(bar.maximum() // 2)
+    position = bar.value()
+
+    window.editor.insertPlainText("x")
+    qtbot.waitUntil(lambda: not window._render_timer.isActive())
+
+    assert position > 0
+    assert bar.value() == position
+
+
+def test_find_searches_preview_when_editor_hidden(window, tmp_path):
+    source = tmp_path / "find.md"
+    source.write_text("alpha\n\nneedle here", encoding="utf-8")
+    window.open_path(source)
+    window.set_view("preview")
+
+    window.find_input.setText("needle")
+    window.find_next()
+
+    assert window.preview.textCursor().selectedText() == "needle"
+
+
+def test_external_change_reloads_clean_document(window, tmp_path):
+    source = tmp_path / "watched.md"
+    source.write_text("before", encoding="utf-8")
+    window.open_path(source)
+    assert str(source.resolve()) in window.watcher.files()
+
+    source.write_text("after", encoding="utf-8")
+    window._on_file_changed(str(source.resolve()))
+
+    assert window.editor.toPlainText() == "after"
+    assert not window.dirty
+
+
+def test_external_change_asks_before_discarding_edits(window, tmp_path, monkeypatch):
+    source = tmp_path / "watched.md"
+    source.write_text("before", encoding="utf-8")
+    window.open_path(source)
+    window.editor.setPlainText("my edits")
+    asked = answer_dialogs(monkeypatch, QMessageBox.StandardButton.No)
+
+    source.write_text("after", encoding="utf-8")
+    window._on_file_changed(str(source.resolve()))
+
+    assert len(asked) == 1
+    assert window.editor.toPlainText() == "my edits"
+    assert window.dirty
+
+
+def test_own_save_does_not_trigger_reload_prompt(window, tmp_path, monkeypatch):
+    source = tmp_path / "watched.md"
+    source.write_text("before", encoding="utf-8")
+    window.open_path(source)
+    window.editor.setPlainText("saved text")
+    window.save()
+    asked = answer_dialogs(monkeypatch, QMessageBox.StandardButton.No)
+
+    window._on_file_changed(str(source.resolve()))
+
+    assert asked == []
+
+
+def test_view_mode_and_zoom_are_remembered(qtbot, window):
+    window.set_view("preview")
+    window.zoom_in()
+    window.zoom_in()
+    window.close()
+
+    reopened = MarkdownWindow()
+    qtbot.addWidget(reopened)
+
+    assert reopened.view_mode == "preview"
+    assert reopened.preview_action.isChecked()
+    assert reopened._zoom == 2
+
+
+def test_status_bar_shows_position_and_format(window, tmp_path):
+    source = tmp_path / "status.md"
+    source.write_bytes(b"one two\r\nthree\r\n")
+
+    window.open_path(source)
+
+    assert "3 words" in window.position_label.text()
+    assert "CRLF" in window.position_label.text()
+    assert "Ln 1, Col 1" in window.position_label.text()
