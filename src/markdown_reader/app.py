@@ -49,6 +49,11 @@ MARKDOWN_EXTENSIONS = {".md", ".markdown", ".mdown", ".mkd"}
 # file:// targets, custom protocol handlers) asks first, because a Markdown file
 # from an untrusted source could otherwise launch an executable with one click.
 SAFE_LINK_SCHEMES = {"http", "https", "mailto"}
+# Raw HTML is shown as text rather than interpreted. Qt hands HTML straight to the
+# rich text engine, where one unclosed or void tag - the `<img>` inside the centred
+# header of a typical README, say - swallows everything after it and leaves the
+# preview blank. Showing the tags is worse looking and far better than showing nothing.
+MARKDOWN_FEATURES = QTextDocument.MarkdownDialectGitHub | QTextDocument.MarkdownNoHTML
 VIEW_MODES = {"split", "preview", "editor"}
 MIN_ZOOM, MAX_ZOOM = -6, 20
 RENDER_DELAY_MS = 150
@@ -417,7 +422,7 @@ class MarkdownWindow(QMainWindow):
         else:
             document.setBaseUrl(QUrl())
         self.preview.blocked_resources = 0
-        document.setMarkdown(text, QTextDocument.MarkdownDialectGitHub)
+        document.setMarkdown(text, MARKDOWN_FEATURES)
         add_heading_anchors(document)
         # Re-rendering resets the preview to the top; keep the reader's place while typing.
         bar.setValue(scroll if keep_scroll else 0)

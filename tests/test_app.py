@@ -443,3 +443,29 @@ def test_split_divider_survives_a_view_switch(qtbot, window):
     reopened = MarkdownWindow()
     qtbot.addWidget(reopened)
     assert reopened._split_sizes == dragged
+
+
+def test_raw_html_does_not_blank_the_preview(window, tmp_path):
+    # A void tag such as the <img> in a centred README header used to swallow
+    # every following block, leaving the preview empty.
+    source = tmp_path / "with-html.md"
+    source.write_text(
+        '<p align="center">\n  <img src="logo.png" width="80">\n</p>\n\n'
+        "# Real heading\n\nProse that must still be readable.\n",
+        encoding="utf-8",
+    )
+
+    window.open_path(source)
+
+    rendered = window.preview.toPlainText()
+    assert "Real heading" in rendered
+    assert "Prose that must still be readable." in rendered
+
+
+def test_markdown_still_renders_around_raw_html(window):
+    window.editor.setPlainText("Text with <br> a void tag and **bold** after it.")
+    window._render_editor()
+
+    rendered = window.preview.toPlainText()
+    assert "bold" in rendered
+    assert "a void tag" in rendered
