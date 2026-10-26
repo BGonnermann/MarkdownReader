@@ -1,0 +1,98 @@
+name: Release
+
+# Builds the portable Windows package on a clean runner when a vX.Y.Z tag is
+# pushed, so what ships comes from a tagged commit and a public build log rather
+# than from whatever happened to be on a maintainer's machine. The build is not
+# bit-for-bit reproducible - zip archives embed timestamps, so the same sources
+# produce a different checksum each run - so the artifact is attested instead:
+# the signed provenance ties this exact file to this commit and this workflow,
+# and anyone can check it with
+#   gh attestation verify MarkdownReader-vX.Y.Z-windows-x64.zip --repo BGonnermann/MarkdownReader
+# The release is left as a draft for a human to review and publish.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --extra dev
+      - name: Check the tag matches the package version
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          # markdown_reader.__version__ and pyproject.toml hold the version separately,
+          # so this also catches the two drifting apart.
+          package="$(uv run python -c "import markdown_reader; print(markdown_reader.__version__)")"
+          project="$(uv run python -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")"
+          echo "tag=$tag package=$package pyproject=$project"
+          if [ "$tag" != "$package" ] || [ "$tag" != "$project" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match the version in the package ($package) and pyproject.toml ($project)"
+            exit 1
+          fi
+      - name: Lint
+        run: uv run ruff check .
+      - name: Run tests
+        run: uv run pytest
+        env:
+          QT_QPA_PLATFORM: offscreen
+      - name: Build the executable
+        shell: bash
+        run: |
+          uv run pyinstaller --noconfirm --clean --windowed \
+            --name "Markdown Reader" \
+            --paths src \
+            --icon src/markdown_reader/assets/icon.ico \
+            --add-data "src/markdown_reader/assets/icon.png;markdown_reader/assets" \
+            src/markdown_reader/app.py
+      - name: Package the portable release
+        shell: pwsh
+        run: |
+          Copy-Item LICENSE, README.md "dist/Markdown Reader/"
+          $zip = "dist/MarkdownReader-$env:GITHUB_REF_NAME-windows-x64.zip"
+          Compress-Archive -Path "dist/Markdown Reader" -DestinationPath $zip -CompressionLevel Optimal
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash *$(Split-Path $zip -Leaf)" | Set-Content "$zip.sha256" -NoNewline
+          Get-Content "$zip.sha256"
+          Add-Content -Path $env:GITHUB_ENV -Value "ZIP=$zip"
+      - name: Check the package extracts and is complete
+        shell: pwsh
+        run: |
+          Expand-Archive -Path $env:ZIP -DestinationPath check
+          foreach ($item in "Markdown Reader\Markdown Reader.exe", "Markdown Reader\_internal", "Markdown Reader\LICENSE", "Markdown Reader\README.md") {
+            if (-not (Test-Path "check\$item")) { throw "Missing from the package: $item" }
+          }
+          $exe = Get-Item "check\Markdown Reader\Markdown Reader.exe"
+          if ($exe.Length -lt 500KB) { throw "Executable is only $($exe.Length) bytes" }
+          "Package looks complete: $([math]::Round((Get-Item $env:ZIP).Length / 1MB, 1)) MB"
+      - name: Attest the package
+        uses: actions/attest-build-provenance@v3.0.0
+        with:
+          subject-path: ${{ env.ZIP }}
+      - name: Draft the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            # A draft for this tag already exists; refresh its assets instead of failing.
+            gh release upload "$GITHUB_REF_NAME" "$ZIP" "$ZIP.sha256" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --draft \
+              --title "Markdown Reader $GITHUB_REF_NAME" \
+              --generate-notes \
+              "$ZIP" "$ZIP.sha256"
+          fi

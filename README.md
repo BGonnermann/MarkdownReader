@@ -115,6 +115,31 @@ dist/Markdown Reader/Markdown Reader.exe
 
 Copy the entire `dist/Markdown Reader` directory when moving the application to another Windows computer.
 
+## Cutting a release
+
+Releases are built by GitHub Actions, not by hand. Bump the version in both
+`pyproject.toml` and `src/markdown_reader/__init__.py`, run `uv lock`, merge that
+to `main`, then push a matching tag:
+
+```bash
+git tag v0.1.5
+git push origin v0.1.5
+```
+
+The workflow refuses to build if the tag and the two version strings disagree. It
+lints, runs the tests, builds the portable package on a clean runner, checks that
+the archive extracts complete, attests the result, and leaves a draft release for
+you to write notes on and publish.
+
+Because zip archives embed timestamps, the same sources do not produce the same
+checksum twice, so the archive is not bit-for-bit reproducible. What is verifiable
+is its provenance - the signed attestation ties the published file to the commit
+and workflow that produced it:
+
+```bash
+gh attestation verify MarkdownReader-v0.1.5-windows-x64.zip --repo BGonnermann/MarkdownReader
+```
+
 ## Development and tests
 
 Install the development dependencies and run the test suite:
