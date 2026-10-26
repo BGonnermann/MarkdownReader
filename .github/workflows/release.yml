@@ -8,7 +8,8 @@ name: Release
 # the signed provenance ties this exact file to this commit and this workflow,
 # and anyone can check it with
 #   gh attestation verify MarkdownReader-vX.Y.Z-windows-x64.zip --repo BGonnermann/MarkdownReader
-# The release is left as a draft for a human to review and publish.
+# Release notes come from the matching section of CHANGELOG.md, so changes are
+# written down in one place. The release is left as a draft to review and publish.
 
 on:
   push:
@@ -81,18 +82,51 @@ jobs:
         uses: actions/attest-build-provenance@v3.0.0
         with:
           subject-path: ${{ env.ZIP }}
+      - name: Take the release notes from the changelog
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # Lift this version's section out of CHANGELOG.md, stopping at the next one.
+          awk -v want="## [$version]" '
+            index($0, want) == 1 { found = 1; next }
+            found && index($0, "## [") == 1 { exit }
+            found && /^\[[^]]+\]: / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error file=CHANGELOG.md::No changelog entry for $version - add a '## [$version]' section before tagging"
+            exit 1
+          fi
+          # Every release should say how to check what it is before running it.
+          zip_name="$(basename "$ZIP")"
+          {
+            echo
+            echo '---'
+            echo
+            echo "**Download** \`$zip_name\`, extract the whole folder, and run **\`Markdown Reader.exe\`**. No Python, \`uv\`, or installer needed."
+            echo
+            echo 'Check where it came from before running it:'
+            echo
+            echo '```bash'
+            echo "gh attestation verify $zip_name --repo $GITHUB_REPOSITORY"
+            echo '```'
+            echo
+            echo "Built from \`$GITHUB_SHA\` by [this run](https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)."
+          } >> notes.md
+          cat notes.md
       - name: Draft the release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            # A draft for this tag already exists; refresh its assets instead of failing.
+            # A draft for this tag already exists; refresh it instead of failing.
+            gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
             gh release upload "$GITHUB_REF_NAME" "$ZIP" "$ZIP.sha256" --clobber
           else
             gh release create "$GITHUB_REF_NAME" \
               --draft \
               --title "Markdown Reader $GITHUB_REF_NAME" \
-              --generate-notes \
+              --notes-file notes.md \
               "$ZIP" "$ZIP.sha256"
           fi
