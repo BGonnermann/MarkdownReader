@@ -343,3 +343,103 @@ def test_status_bar_shows_position_and_format(window, tmp_path):
     assert "3 words" in window.position_label.text()
     assert "CRLF" in window.position_label.text()
     assert "Ln 1, Col 1" in window.position_label.text()
+
+
+def test_preview_blocks_unc_and_remote_references(window, tmp_path):
+    source = tmp_path / "tracker.md"
+    source.write_text("![pixel](//attacker/share/pixel.png)\n", encoding="utf-8")
+
+    window.open_path(source)
+    window.show()
+    window.preview.repaint()
+
+    assert window.preview.blocked_resources > 0
+
+
+@pytest.mark.parametrize(
+    ("url", "allowed"),
+    [
+        (QUrl.fromLocalFile("C:/docs/image.png"), True),
+        (QUrl("image.png"), True),
+        (QUrl("data:image/png;base64,AAAA"), True),
+        (QUrl(), True),
+        (QUrl("//attacker/share/pixel.png"), False),
+        (QUrl("file://attacker/share/pixel.png"), False),
+        (QUrl("http://example.com/pixel.png"), False),
+        (QUrl("https://example.com/pixel.png"), False),
+        (QUrl("ftp://example.com/pixel.png"), False),
+    ],
+)
+def test_preview_resource_policy(url, allowed):
+    assert app.PreviewBrowser._is_allowed(url) is allowed
+
+
+def test_heading_anchors_let_in_document_links_jump(window, tmp_path):
+    source = tmp_path / "toc.md"
+    source.write_text(
+        "# Title\n\n[Go](#deep-section)\n\n" + "filler\n\n" * 80 + "## Deep Section\n\nend\n",
+        encoding="utf-8",
+    )
+
+    window.open_path(source)
+    window.show()
+    window.preview.resize(500, 300)
+    window._open_link(QUrl("#deep-section"))
+
+    assert window.preview.verticalScrollBar().value() > 0
+
+
+def test_repeated_headings_get_distinct_anchors(window):
+    window.editor.setPlainText("# Notes\n\ntext\n\n# Notes\n")
+    window._render_editor()
+
+    names = []
+    block = window.preview.document().begin()
+    while block.isValid():
+        if block.blockFormat().headingLevel():
+            names.extend(block.begin().fragment().charFormat().anchorNames())
+        block = block.next()
+
+    assert names == ["notes", "notes-1"]
+
+
+def test_failed_save_keeps_the_original_file(window, tmp_path, monkeypatch):
+    source = tmp_path / "keep.md"
+    source.write_text("original\n", encoding="utf-8")
+    window.open_path(source)
+    window.editor.setPlainText("replacement")
+    monkeypatch.setattr(app.os, "replace", lambda *args: (_ for _ in ()).throw(OSError("disk full")))
+
+    assert window.save() is False
+
+    assert source.read_text(encoding="utf-8") == "original\n"
+    assert list(tmp_path.glob(".*.saving")) == []
+
+
+def test_classic_mac_line_endings_are_preserved(window, tmp_path):
+    source = tmp_path / "mac.md"
+    source.write_bytes(b"one\rtwo\r")
+
+    window.open_path(source)
+    assert window.newline == "\r"
+    assert "CR" in window.position_label.text()
+
+    window.editor.setPlainText("one\ntwo\nthree")
+    assert window.save()
+    assert source.read_bytes() == b"one\rtwo\rthree"
+
+
+def test_split_divider_survives_a_view_switch(qtbot, window):
+    window.show()
+    window.splitter.setSizes([300, 800])
+    window._remember_split()
+    dragged = window.splitter.sizes()
+
+    window.set_view("preview")
+    window.set_view("split")
+    assert window.splitter.sizes() == dragged
+
+    window.close()
+    reopened = MarkdownWindow()
+    qtbot.addWidget(reopened)
+    assert reopened._split_sizes == dragged

@@ -1,6 +1,6 @@
 [project]
 name = "markdown-reader"
-version = "0.1.3"
+version = "0.1.4"
 description = "A simple, lightweight desktop Markdown reader and editor"
 readme = "README.md"
 license = "MIT"

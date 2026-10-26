@@ -30,15 +30,18 @@ Markdown Reader gives you a live rendered preview beside the Markdown source, ac
 - Unsaved-change protection
 - Local images and links resolved relative to the Markdown file; links to other Markdown files open in the app
 - Asks before a link launches a local program or a non-web protocol, so an untrusted document can't run an `.exe` with one click
+- Never fetches anything off the machine: an image pointing at a network share or a remote URL is refused, so a document can't use a tracking pixel to leak your Windows credentials
+- In-document links to headings (`[Section](#section)`) jump to them
 - Automatically reloads a file when another program changes it (asks first if you have unsaved edits)
-- Keeps each file's original encoding (UTF-8, UTF-8 with BOM, Windows-1252) and line endings (LF/CRLF) when saving
+- Keeps each file's original encoding (UTF-8, UTF-8 with BOM, Windows-1252) and line endings (LF, CRLF, CR) when saving
+- Saves through a temporary file, so a failed save can't leave the original truncated
 - Status bar with line, column, word count, encoding, and line endings
-- Remembers your view mode and zoom level
+- Remembers your view mode, zoom level, and the split divider position
 - Familiar Windows keyboard shortcuts
 
 ## Download for Windows
 
-For the easiest setup, open the [latest GitHub Release](https://github.com/BGonnermann/MarkdownReader/releases/latest), download `MarkdownReader-v0.1.3-windows-x64.zip`, extract the entire folder, and run **`Markdown Reader.exe`**.
+For the easiest setup, open the [latest GitHub Release](https://github.com/BGonnermann/MarkdownReader/releases/latest), download `MarkdownReader-v0.1.4-windows-x64.zip`, extract the entire folder, and run **`Markdown Reader.exe`**.
 
 The portable release does not require Python, `uv`, or an installer.
 
@@ -122,7 +125,7 @@ uv run ruff check .
 uv run pytest
 ```
 
-The tests cover drag-and-drop routing, Markdown loading and rendering, encoding and line-ending preservation, Save As, link safety, reloading on external changes, find, view and zoom controls, and real PDF generation.
+The tests cover drag-and-drop routing, Markdown loading and rendering, encoding and line-ending preservation, atomic saves, Save As, link safety, the preview's refusal to fetch off-machine resources, heading anchors, reloading on external changes, find, view and zoom controls, and real PDF generation.
 
 ## Technology
 
