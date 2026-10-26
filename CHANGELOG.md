@@ -16,6 +16,13 @@ with a portable Windows build attached.
   and how to report one.
 - A screenshot in the README, plus badges for the current release and download count.
 
+### Fixed
+
+- A document containing raw HTML no longer renders as a blank preview. One void or
+  unclosed tag - the `<img>` in a centred README header, for instance - swallowed
+  every block after it, so this project's own README showed almost nothing. Raw
+  HTML is now shown as text instead of being handed to the rich text engine.
+
 ### Changed
 
 - Release notes are taken from this file's matching section instead of an
